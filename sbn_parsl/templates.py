@@ -263,11 +263,11 @@ singularity run $MNT_ARG {{container}} <<EOF
     set +e
 EOF
 
-echo "mv *.root $(dirname {{output}}) || true"
-mv *.root $(dirname {{output}}) || true
+echo "cp *.root $(dirname {{output}}) || true"
+cp *.root $(dirname {{output}}) || true
 
-echo "mv *.json $(dirname {{output}}) || true"
-mv *.json $(dirname {{output}}) || true
+echo "cp *.json $(dirname {{output}}) || true"
+cp *.json $(dirname {{output}}) || true
 
 {{post_job_hook}}
 {JOB_POST}
