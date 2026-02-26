@@ -43,6 +43,8 @@ from typing import List, Tuple, Dict, Optional, Callable
 
 from sbn_parsl.utils import hash_name
 
+from concurrent.futures import as_completed
+
 
 class NoInputFileException(Exception):
     pass
@@ -724,14 +726,18 @@ class WorkflowExecutor:
         """Loop over all tasks & clear finished ones."""
         remaining_futures = []
 
-        # these counters print the # of successes/failures since the last
-        # update, separate from the total workflow count
+        # these counters print the # of cumulative successes/failures
         npass = 0
         nfail = 0
-        for f in self.futures:
-            if not f.done():
-                remaining_futures.append(f)
-                continue
+
+        report_time_interval = 10 # seconds
+        report_count_interval = 10 # number of tasks
+
+        last_report_time = time.perf_counter()
+        last_report_count = 0
+
+        print(f'Checking results for {len(self.futures)} futures...')
+        for f in as_completed(self.futures):
 
             success = False
             try:
@@ -745,6 +751,7 @@ class WorkflowExecutor:
                 self._fail_counter += 1
 
             if success:
+                # is there a step here where we add the next future to the list of futures?
                 self.mark_stage_in_db(f.stage_id)
                 # try/except for backwards compatibility
                 try:
@@ -758,11 +765,16 @@ class WorkflowExecutor:
                 except AttributeError as e:
                     print(f'Future is missing workflow_id attribute required for caching. Please set in the runfunc!')
 
-        print(f'Futures [SUCCESS]/[FAILED]: {npass}/{nfail}')
-
-        if npass > 0:
-            self.backup_db()
-        self.futures = remaining_futures
+            if ((time.perf_counter() - last_report_time > report_time_interval) 
+                or (npass + nfail - last_report_count >= report_count_interval)):
+                print(f'Futures [SUCCESS]/[FAILED]: {npass}/{nfail}')
+                last_report_time = time.perf_counter()
+                last_report_count = npass + nfail
+        
+            self.backup_db() # what is the overhead for backup? Should we do this after every task or less frequently?
+            remaining_futures = self.futures.copy()
+            remaining_futures.remove(f)
+            self.futures = remaining_futures
 
     def backup_db(self, nretries: int=5):
         """Sync the in-memory database with the disk one.
