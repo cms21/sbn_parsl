@@ -43,7 +43,7 @@ from typing import List, Tuple, Dict, Optional, Callable
 
 from sbn_parsl.utils import hash_name
 
-from concurrent.futures import as_completed
+from concurrent.futures import as_completed, TimeoutError
 
 
 class NoInputFileException(Exception):
@@ -689,15 +689,11 @@ class WorkflowExecutor:
                 wfs[idx] = this_wf
                 self._workflow_counters[wfs[idx]._id] = {'done': 0, 'nfinal': wfs[idx].n_final_stages}
 
-            # rate-limit the number of concurrent futures to avoid using too
+            # set check_max to rate-limit the number of concurrent futures to avoid using too
             # much memory on login nodes (set to negative number to disable)
-            while len(self.futures) > self.max_futures and self._future_limit:
-                self.get_task_results()
-                # still too many?
-                if len(self.futures) > self.max_futures:
-                    print(f'Waiting: Current futures={len(self.futures)}')
-                    time.sleep(10)
-
+            if len(self.futures) > self.max_futures and self._future_limit:
+                self.get_task_results(check_max=True)
+                
             try:
                 next(wfs[idx].get_next_task())
             except StopIteration:
@@ -710,10 +706,9 @@ class WorkflowExecutor:
                 # let garbage collection happen
                 wfs[idx] = None
         
-        while len(self.futures) > 0:
-            print(f'waiting for tasks to finish ({len(self.futures)})')
-            self.get_task_results()
-            time.sleep(10)
+        
+        print(f'waiting for tasks to finish ({len(self.futures)})')
+        self.get_task_results(check_max=False)
 
         self.backup_db()
         self._mem_db.close()
@@ -722,59 +717,70 @@ class WorkflowExecutor:
         print(f'(submitted/skipped) = ({self._stage_counter}/{self._skip_counter})')
         print(f'(success/fail) = ({self._success_counter}/{self._fail_counter})')
 
-    def get_task_results(self):
+    def get_task_results(self, timeout_thresh = None, check_max: bool=False):
         """Loop over all tasks & clear finished ones."""
-        remaining_futures = []
-
-        # these counters print the # of cumulative successes/failures
+        # these counters print the # of successes/fails
         npass = 0
         nfail = 0
-
-        report_time_interval = 10 # seconds
-        report_count_interval = 10 # number of tasks
-
-        last_report_time = time.perf_counter()
-        last_report_count = 0
+        start_time = time.perf_counter()
 
         print(f'Checking results for {len(self.futures)} futures...')
-        for f in as_completed(self.futures):
 
-            success = False
-            try:
-                f.result()
-                success = True
-                npass += 1
-                self._success_counter += 1
-            except Exception as e:
-                print(f'[FAILED] task {f.tid} {f.filepath} ({e})')
-                nfail += 1
-                self._fail_counter += 1
 
-            if success:
-                # is there a step here where we add the next future to the list of futures?
-                self.mark_stage_in_db(f.stage_id)
-                # try/except for backwards compatibility
+        try:
+            for f in as_completed(self.futures, timeout=timeout_thresh):
+
+                remaining_futures = self.futures.copy()
+                remaining_futures.remove(f)
+                self.futures = remaining_futures
+
+                success = False
                 try:
-                    if f.final:
-                        self._workflow_counters[f.workflow_id]['done'] += 1
-                        if self._workflow_counters[f.workflow_id]['done'] == \
-                                self._workflow_counters[f.workflow_id]['nfinal']:
-                            # mark in DB that this workflow is fully finished
-                            print(f'Workflow {f.workflow_id} completed successfully!')
-                            self.mark_workflow_in_db(f.workflow_id)
-                except AttributeError as e:
-                    print(f'Future is missing workflow_id attribute required for caching. Please set in the runfunc!')
+                    f.result()
+                    success = True
+                    npass += 1
+                    self._success_counter += 1
+                except Exception as e:
+                    print(f'[FAILED] task {f.tid} {f.filepath} ({e})')
+                    nfail += 1
+                    self._fail_counter += 1
 
-            if ((time.perf_counter() - last_report_time > report_time_interval) 
-                or (npass + nfail - last_report_count >= report_count_interval)):
-                print(f'Futures [SUCCESS]/[FAILED]: {npass}/{nfail}')
-                last_report_time = time.perf_counter()
-                last_report_count = npass + nfail
+                if success:
+                    # is there a step here where we add the next future to the list of futures?
+                    self.mark_stage_in_db(f.stage_id)
+                    # try/except for backwards compatibility
+                    try:
+                        if f.final:
+                            self._workflow_counters[f.workflow_id]['done'] += 1
+                            if self._workflow_counters[f.workflow_id]['done'] == \
+                                    self._workflow_counters[f.workflow_id]['nfinal']:
+                                # mark in DB that this workflow is fully finished
+                                print(f'Workflow {f.workflow_id} completed successfully!')
+                                self.mark_workflow_in_db(f.workflow_id)
+                    except AttributeError as e:
+                        print(f'Future is missing workflow_id attribute required for caching. Please set in the runfunc!')
+            
+                self.backup_db() # what is the overhead for backup? Should we do this after every task or less frequently?
+                
+                # If the number of futures is less than the max, exit the loop to allow more tasks to be submitted
+                if check_max:
+                    elapsed_time = time.perf_counter() - start_time
+                    if len(self.futures) < self.max_futures and elapsed_time > 10:
+                        print(f'Futures [SUCCESS]/[FAILED]: {npass}/{nfail}')
+                        print(f"Time to refill futures! Current futures={len(self.futures)} out of {self.max_futures} max.")
+                        #time.sleep(10)
+                        break
+                
+                if npass + nfail > 10 or time.perf_counter() - start_time > 10:
+                    print(f'Futures [SUCCESS]/[FAILED]: {npass}/{nfail}')
+                    print(f"waiting for remaining {len(self.futures)} futures to complete...")
+                    npass = 0
+                    nfail = 0
+                    start_time = time.perf_counter()
+                    
+        except TimeoutError:
+            pass
         
-            self.backup_db() # what is the overhead for backup? Should we do this after every task or less frequently?
-            remaining_futures = self.futures.copy()
-            remaining_futures.remove(f)
-            self.futures = remaining_futures
 
     def backup_db(self, nretries: int=5):
         """Sync the in-memory database with the disk one.
