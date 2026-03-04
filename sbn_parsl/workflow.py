@@ -691,8 +691,9 @@ class WorkflowExecutor:
 
             # set check_max to rate-limit the number of concurrent futures to avoid using too
             # much memory on login nodes (set to negative number to disable)
-            if len(self.futures) > self.max_futures and self._future_limit:
-                self.get_task_results(check_max=True)
+            while len(self.futures) > self.max_futures and self._future_limit:
+                self.get_task_results(timeout_thresh=10)
+                print(f"waiting for remaining {len(self.futures)} futures to complete...")
                 
             try:
                 next(wfs[idx].get_next_task())
@@ -708,7 +709,7 @@ class WorkflowExecutor:
         
         
         print(f'waiting for tasks to finish ({len(self.futures)})')
-        self.get_task_results(check_max=False)
+        self.get_task_results()
 
         self.backup_db()
         self._mem_db.close()
@@ -724,7 +725,7 @@ class WorkflowExecutor:
         nfail = 0
         start_time = time.perf_counter()
 
-        print(f'Checking results for {len(self.futures)} futures...')
+        #print(f'Checking results for {len(self.futures)} futures...')
 
 
         try:
@@ -762,21 +763,25 @@ class WorkflowExecutor:
             
                 self.backup_db() # what is the overhead for backup? Should we do this after every task or less frequently?
                 
-                # If the number of futures is less than the max, exit the loop to allow more tasks to be submitted
-                if check_max:
-                    elapsed_time = time.perf_counter() - start_time
-                    if len(self.futures) < self.max_futures and elapsed_time > 10:
-                        print(f'Futures [SUCCESS]/[FAILED]: {npass}/{nfail}')
-                        print(f"Time to refill futures! Current futures={len(self.futures)} out of {self.max_futures} max.")
-                        #time.sleep(10)
-                        break
-                
-                if npass + nfail > 10 or time.perf_counter() - start_time > 10:
+                # # Exit loop if more than 10 seconds have elapsed since dropping below the max future limit
+                # if check_max:
+                #     elapsed_time = time.perf_counter() - start_time
+                #     if len(self.futures) < self.max_futures and elapsed_time > 10:
+                #         print(f'Futures [SUCCESS]/[FAILED]: {npass}/{nfail}')
+                #         print(f"Time to refill futures! Current futures={len(self.futures)} out of {self.max_futures} max.")
+                #         break
+
+                # Report every 10 completed tasks
+                elapsed_time = time.perf_counter() - start_time
+                if npass + nfail >= 10 or elapsed_time > 10:
                     print(f'Futures [SUCCESS]/[FAILED]: {npass}/{nfail}')
-                    print(f"waiting for remaining {len(self.futures)} futures to complete...")
                     npass = 0
                     nfail = 0
                     start_time = time.perf_counter()
+
+                # # Only reset timer if we have enough futures to check
+                # if len(self.futures) >= self.max_futures:
+                #     start_time = time.perf_counter()
                     
         except TimeoutError:
             pass
